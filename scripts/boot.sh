@@ -3,7 +3,9 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 export DEBIAN_FRONTEND=noninteractive
 
-mkdir -p /etc/vps "$RUN" /data /var/cache/rclone-vps
+MNT=/mnt/vpsdata
+
+mkdir -p /etc/vps "$RUN" "$MNT" /var/cache/rclone-vps
 chmod 1777 "$RUN"
 
 apt-get update -qq
@@ -19,35 +21,37 @@ echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev; chmod 440 /etc/sudoers.d
 
 rclone mkdir gdrive:vps/data
 
-# ---- تجهيز FUSE ----
 modprobe fuse 2>/dev/null || true
 chmod 666 /dev/fuse 2>/dev/null || true
-chmod u+s /usr/bin/fusermount3 2>/dev/null || true
-ls -l /dev/fuse /usr/bin/fusermount3 || true
 
-MOUNT_OPTS="--uid 2000 --gid 2000 --umask 022 \
+MOUNT_OPTS="--allow-other --uid 2000 --gid 2000 --umask 022 \
   --vfs-cache-mode full --vfs-cache-max-size 6G --vfs-cache-max-age 24h \
   --dir-cache-time 15s --poll-interval 15s --vfs-write-back 5s \
   --cache-dir /var/cache/rclone-vps --rc --rc-addr 127.0.0.1:5572 --rc-no-auth \
   --log-file /tmp/rclone-mount.log -v"
 
-nohup rclone mount gdrive:vps/data /data --allow-other $MOUNT_OPTS > /dev/null 2>&1 &
+start_mount() {
+  : > /tmp/rclone-mount.log
+  nohup rclone mount gdrive:vps/data "$MNT" $MOUNT_OPTS > /dev/null 2>&1 &
+  for _ in $(seq 1 30); do mountpoint -q "$MNT" && return 0; sleep 1; done
+  return 1
+}
 
-for _ in $(seq 1 30); do mountpoint -q /data && break; sleep 1; done
-
-if ! mountpoint -q /data; then
-  log "mount with --allow-other failed, log:"
+if ! start_mount; then
+  log "mount failed, log:"
   cat /tmp/rclone-mount.log || true
   pkill -f "rclone mount" 2>/dev/null || true
+  log "disabling fusermount3 AppArmor profile and retrying..."
+  apparmor_parser -R /etc/apparmor.d/fusermount3 2>/dev/null || true
   sleep 2
-  : > /tmp/rclone-mount.log
-  log "retrying without --allow-other..."
-  nohup rclone mount gdrive:vps/data /data $MOUNT_OPTS > /dev/null 2>&1 &
-  for _ in $(seq 1 30); do mountpoint -q /data && break; sleep 1; done
+  start_mount || true
 fi
 
-mountpoint -q /data || { log "Drive mount failed"; cat /tmp/rclone-mount.log; dmesg 2>/dev/null | tail -n 15 || true; exit 1; }
-log "Drive mounted on /data"
+mountpoint -q "$MNT" || { log "Drive mount failed"; cat /tmp/rclone-mount.log; dmesg 2>/dev/null | grep -i apparmor | tail -n 5 || true; exit 1; }
+
+if [ -d /data ] && [ ! -L /data ]; then rmdir /data 2>/dev/null || true; fi
+ln -sfn "$MNT" /data
+log "Drive mounted on $MNT (linked as /data)"
 
 rclone mkdir gdrive:vps/restic
 restic cat config > /dev/null 2>&1 || restic init
