@@ -19,14 +19,35 @@ echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev; chmod 440 /etc/sudoers.d
 
 rclone mkdir gdrive:vps/data
 
-nohup rclone mount gdrive:vps/data /data --allow-other --uid 2000 --gid 2000 --umask 022 \
+# ---- تجهيز FUSE ----
+modprobe fuse 2>/dev/null || true
+chmod 666 /dev/fuse 2>/dev/null || true
+chmod u+s /usr/bin/fusermount3 2>/dev/null || true
+ls -l /dev/fuse /usr/bin/fusermount3 || true
+
+MOUNT_OPTS="--uid 2000 --gid 2000 --umask 022 \
   --vfs-cache-mode full --vfs-cache-max-size 6G --vfs-cache-max-age 24h \
   --dir-cache-time 15s --poll-interval 15s --vfs-write-back 5s \
   --cache-dir /var/cache/rclone-vps --rc --rc-addr 127.0.0.1:5572 --rc-no-auth \
-  --log-file /tmp/rclone-mount.log -v > /dev/null 2>&1 &
+  --log-file /tmp/rclone-mount.log -v"
+
+nohup rclone mount gdrive:vps/data /data --allow-other $MOUNT_OPTS > /dev/null 2>&1 &
 
 for _ in $(seq 1 30); do mountpoint -q /data && break; sleep 1; done
-mountpoint -q /data || { log "Drive mount failed"; cat /tmp/rclone-mount.log; exit 1; }
+
+if ! mountpoint -q /data; then
+  log "mount with --allow-other failed, log:"
+  cat /tmp/rclone-mount.log || true
+  pkill -f "rclone mount" 2>/dev/null || true
+  sleep 2
+  : > /tmp/rclone-mount.log
+  log "retrying without --allow-other..."
+  nohup rclone mount gdrive:vps/data /data $MOUNT_OPTS > /dev/null 2>&1 &
+  for _ in $(seq 1 30); do mountpoint -q /data && break; sleep 1; done
+fi
+
+mountpoint -q /data || { log "Drive mount failed"; cat /tmp/rclone-mount.log; dmesg 2>/dev/null | tail -n 15 || true; exit 1; }
+log "Drive mounted on /data"
 
 rclone mkdir gdrive:vps/restic
 restic cat config > /dev/null 2>&1 || restic init
